@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# u-up — is this website down for everyone, or just me?
+#
+# Usage: u-up [options] <url|domain> [<url|domain> ...]
+#
+# Exit codes:
+#   0  all sites are up
+#   1  at least one site is down
+#   2  usage error / missing dependency
+
+set -u
+
+VERSION="1.0.0"
+TIMEOUT=10
+VERBOSE=0
+PROG="$(basename "$0")"
+
+# ---------- colors (only when writing to a terminal) ----------
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  DIM=$'\033[2m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  RED=""; GREEN=""; YELLOW=""; DIM=""; BOLD=""; RESET=""
+fi
+
+usage() {
+  cat <<EOF
+${BOLD}$PROG${RESET} $VERSION — check whether a website is up
+
+Usage:
+  $PROG [options] <url|domain> [<url|domain> ...]
+
+Options:
+  -v, --verbose        Show details: IP, redirects, and timing breakdown
+  -t, --timeout SECS   Max seconds to wait per site (default: $TIMEOUT)
+  -h, --help           Show this help
+  -V, --version        Show version
+
+Examples:
+  $PROG example.com
+  $PROG --verbose https://github.com
+  $PROG -t 5 google.com cloudflare.com
+
+A site counts as UP if it answers with an HTTP status below 500
+(even 401/403/404 mean the server is alive). 5xx errors, timeouts,
+DNS failures, refused connections, and TLS errors count as DOWN.
+EOF
+}
+
+die() { echo "$PROG: $*" >&2; exit 2; }
+
+# ---------- argument parsing ----------
+targets=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -v|--verbose) VERBOSE=1 ;;
+    -t|--timeout)
+      [[ $# -ge 2 ]] || die "$1 requires a value"
+      TIMEOUT="$2"; shift ;;
+    --timeout=*) TIMEOUT="${1#*=}" ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+    --) shift; targets+=("$@"); break ;;
+    -*) die "unknown option: $1 (try --help)" ;;
+    *) targets+=("$1") ;;
+  esac
+  shift
+done
+
+[[ ${#targets[@]} -gt 0 ]] || { usage >&2; exit 2; }
+[[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die "timeout must be a positive integer"
+command -v curl >/dev/null 2>&1 || die "curl is required but not installed"
+
+# ---------- helpers ----------
+ms() { awk -v s="$1" 'BEGIN { printf "%d", s * 1000 }'; }
+
+normalize_url() {
+  local u="$1"
+  [[ "$u" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]] || u="https://$u"
+  echo "$u"
+}
+
+extract_host() {
+  local h="${1#*://}"
+  h="${h%%/*}"; h="${h##*@}"; h="${h%%:*}"
+  echo "$h"
+}
+
+# Translate curl exit codes into something human.
+curl_reason() {
+  case "$1" in
+    6)  echo "DNS lookup failed (domain doesn't resolve)" ;;
+    7)  echo "connection refused / couldn't connect" ;;
+    28) echo "timed out after ${TIMEOUT}s" ;;
+    35|51|58|59|60|64|66|77|82|83|90|91)
+        echo "TLS/SSL error (curl exit $1)" ;;
+    47) echo "too many redirects" ;;
+    52) echo "server returned an empty reply" ;;
+    56) echo "connection reset while receiving data" ;;
+    *)  echo "request failed (curl exit $1)" ;;
+  esac
+}
+
+# Is the *user's* internet working? Helps answer "down for everyone or just me?"
+local_internet_ok() {
+  curl -s -o /dev/null --max-time 5 --connect-timeout 5 http://1.1.1.1 2>/dev/null \
+    || curl -s -o /dev/null --max-time 5 --connect-timeout 5 https://8.8.8.8 2>/dev/null
+}
+
+WRITE_OUT='%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{num_redirects}|%{url_effective}|%{remote_ip}'
+
+run_curl() {  # $1 = url, $2 = method flag (-I for HEAD, empty for GET)
+  local -a flags=(-s -o /dev/null -L --max-redirs 10
+                  --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT"
+                  -A "u-up/$VERSION (+status-check)" -w "$WRITE_OUT")
+  [[ -n "$2" ]] && flags+=("$2")
+  curl "${flags[@]}" "$1"
+}
+
+# ---------- core check ----------
+check_site() {
+  local input="$1" url host out rc
+  url="$(normalize_url "$input")"
+  host="$(extract_host "$url")"
+
+  [[ -n "$host" ]] || { echo "${RED}✖${RESET} ${BOLD}$input${RESET} — not a valid URL"; return 1; }
+
+  out="$(run_curl "$url" -I)"; rc=$?
+
+  # Some servers reject HEAD — retry with GET.
+  if [[ $rc -eq 0 ]]; then
+    local probe="${out%%|*}"
+    if [[ "$probe" == "405" || "$probe" == "501" ]]; then
+      out="$(run_curl "$url" "")"; rc=$?
+    fi
+  fi
+
+  local code t_dns t_conn t_tls t_ttfb t_total redirects final_url ip
+  IFS='|' read -r code t_dns t_conn t_tls t_ttfb t_total redirects final_url ip <<<"$out"
+
+  local is_up=0 reason=""
+  if [[ $rc -ne 0 ]]; then
+    reason="$(curl_reason "$rc")"
+  elif [[ "$code" =~ ^[0-9]{3}$ && "$code" -ge 500 ]]; then
+    reason="server error (HTTP $code)"
+  elif [[ "$code" =~ ^[0-9]{3}$ && "$code" -ge 100 ]]; then
+    is_up=1
+  else
+    reason="no valid HTTP response"
+  fi
+
+  # ----- summary line -----
+  if [[ $is_up -eq 1 ]]; then
+    local note=""
+    [[ "$code" -ge 400 ]] && note=" ${YELLOW}(reachable, but returned a client error)${RESET}"
+    echo "${GREEN}✔${RESET} ${BOLD}$host${RESET} is ${GREEN}UP${RESET} — HTTP $code in $(ms "$t_total")ms$note"
+  else
+    echo "${RED}✖${RESET} ${BOLD}$host${RESET} is ${RED}DOWN${RESET} — $reason"
+    if local_internet_ok; then
+      echo "  ${DIM}Your internet connection works, so this looks like a problem with the site.${RESET}"
+    else
+      echo "  ${YELLOW}Heads up: your own internet connection looks broken — the site may be fine.${RESET}"
+    fi
+  fi
+
+  # ----- verbose details -----
+  if [[ $VERBOSE -eq 1 ]]; then
+    echo "  ${DIM}URL checked : $url${RESET}"
+    if [[ $rc -eq 0 ]]; then
+      echo "  ${DIM}IP address  : ${ip:-unknown}${RESET}"
+      echo "  ${DIM}Redirects   : ${redirects:-0}${RESET}"
+      [[ "$final_url" != "$url" && "$final_url" != "$url/" ]] && \
+        echo "  ${DIM}Final URL   : $final_url${RESET}"
+      echo "  ${DIM}DNS lookup  : $(ms "$t_dns")ms${RESET}"
+      echo "  ${DIM}TCP connect : $(ms "$t_conn")ms${RESET}"
+      if [[ "$(ms "$t_tls")" -gt 0 ]]; then
+        echo "  ${DIM}TLS         : $(ms "$t_tls")ms${RESET}"
+      fi
+      echo "  ${DIM}First byte  : $(ms "$t_ttfb")ms${RESET}"
+      echo "  ${DIM}Total       : $(ms "$t_total")ms${RESET}"
+    else
+      echo "  ${DIM}curl exit   : $rc${RESET}"
+    fi
+    echo
+  fi
+
+  [[ $is_up -eq 1 ]]
+}
+
+# ---------- main ----------
+exit_code=0
+for t in "${targets[@]}"; do
+  check_site "$t" || exit_code=1
+done
+exit "$exit_code"
